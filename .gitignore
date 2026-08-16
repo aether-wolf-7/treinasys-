@@ -1,0 +1,53 @@
+# Dependências
+node_modules/
+.pnp
+.pnp.js
+
+# Build
+dist/
+build/
+*.tsbuildinfo
+
+# Ambiente e segredos — NUNCA commitar
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+service-account*.json
+credentials*.json
+
+# Prisma
+prisma/*.db
+prisma/*.db-journal
+
+# Uploads locais (em produção vai pro object storage)
+uploads/
+tmp/
+storage/
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Testes
+coverage/
+.nyc_output/
+
+# Editor e SO
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Cache
+.cache/
+.turbo/
+.eslintcache
+.vite/

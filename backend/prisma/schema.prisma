@@ -1,0 +1,1554 @@
+// TreinaSys — schema de dados
+// Multitenancy: shared database + shared schema, isolado por `tenant_id`.
+//
+// Convenção de isolamento (importante para quem for dar manutenção):
+//   - TODA tabela de negócio carrega a coluna `tenant_id`, indexada, e TODA query
+//     passa pelo middleware de tenant (src/middlewares/tenant.ts). Nenhuma query
+//     de negócio pode ser escrita sem esse filtro.
+//   - A relação Prisma explícita com Tenant é declarada nos agregados de topo
+//     (User, Training, Enrollment, Certificate, Turma, ...). Nas tabelas filhas
+//     (Slide, QuestionOption, SlideProgress, ...) o `tenantId` existe como escalar
+//     indexado, sem FK própria: a integridade vem em cascata pelo pai, e a coluna
+//     serve para o filtro de isolamento e para a localidade dos índices.
+//   - Usuário MASTER é global: `tenantId` nulo. Nenhuma outra role pode ter nulo.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Hierarquia de perfis do Plano Mestre (5 = maior).
+enum Role {
+  MASTER // 5 — global, opera a plataforma inteira
+  ADMIN // 4 — administra um tenant
+  GESTOR // 3 — gerencia uma equipe/setor
+  INSTRUTOR // 2 — cria e mantém conteúdo
+  COLABORADOR // 1 — consome treinamento (motorista)
+}
+
+enum TenantStatus {
+  TRIAL
+  ATIVO
+  SUSPENSO
+  CANCELADO
+}
+
+enum PlanTier {
+  BASICO
+  PROFISSIONAL
+  ENTERPRISE
+}
+
+/// PLATAFORMA = catálogo da TreinaSys (tenantId nulo, visível a todos os tenants).
+/// PROPRIO    = curso criado pela empresa, invisível para os demais tenants.
+enum TrainingOrigin {
+  PLATAFORMA
+  PROPRIO
+}
+
+enum Modalidade {
+  EAD
+  PRESENCIAL
+  AMBOS
+}
+
+enum TrainingStatus {
+  RASCUNHO
+  PUBLICADO
+  ARQUIVADO
+}
+
+enum SlideType {
+  TEXTO
+  IMAGEM
+  VIDEO
+  PDF
+  EMBED
+  HTML
+}
+
+enum EnrollmentStatus {
+  NAO_INICIADO
+  EM_ANDAMENTO
+  CONCLUIDO
+  REPROVADO
+  EXPIRADO
+  CANCELADO
+}
+
+enum QuestionKind {
+  FIXACAO
+  PROVA_FINAL
+}
+
+enum QuestionFormat {
+  MULTIPLA_ESCOLHA
+  VERDADEIRO_FALSO
+}
+
+enum AttemptStatus {
+  EM_ANDAMENTO
+  APROVADO
+  REPROVADO
+  ABANDONADO
+}
+
+/// Origem da conclusão: define o fluxo que gerou o certificado.
+enum CompletionOrigin {
+  EAD
+  PRESENCIAL
+}
+
+enum CertificateStatus {
+  VALIDO
+  EXPIRADO
+  REVOGADO
+}
+
+enum TurmaStatus {
+  AGENDADA
+  EM_ANDAMENTO
+  CONCLUIDA
+  CANCELADA
+}
+
+enum AttendanceStatus {
+  AUSENTE
+  PRESENTE
+  JUSTIFICADO
+}
+
+enum NotificationChannel {
+  EMAIL
+  WHATSAPP
+}
+
+enum NotificationEvent {
+  MATRICULA
+  LEMBRETE_PENDENTE
+  PRAZO_PROXIMO
+  CONCLUSAO
+  CERTIFICADO_EMITIDO
+  VENCIMENTO_PROXIMO
+  VENCIDO
+  AVALIACAO_REACAO
+  AVALIACAO_EFICACIA
+  RECUPERACAO_SENHA
+  TURMA_AGENDADA
+}
+
+enum NotificationStatus {
+  PENDENTE
+  ENVIADO
+  FALHOU
+  CANCELADO
+}
+
+enum ReactionScale {
+  LIKERT_5
+  NPS_0_10
+  SIM_NAO
+  TEXTO_LIVRE
+}
+
+enum EfficacyStatus {
+  PENDENTE
+  RESPONDIDA
+  EXPIRADA
+}
+
+enum EfficacyResult {
+  SATISFATORIO
+  PARCIAL
+  INSATISFATORIO
+}
+
+/// Documentos de consentimento LGPD (aceite no primeiro acesso).
+/// Não confundir com o "termo de responsabilidade" do Módulo 9, que é outra coisa
+/// e vive em ResponsibilityTerm.
+enum ConsentKind {
+  USO
+  PRIVACIDADE
+  CONSENTIMENTO_LGPD
+}
+
+/// Modelo de termo de responsabilidade: assinado na tela ou impresso e digitalizado.
+/// Espelha os dois modelos que o piloto já usa (TERMO_MODELO_DIGITAL / FISICO).
+enum TermTemplateKind {
+  DIGITAL
+  FISICO
+}
+
+/// Guard de fases do motor de treinamento (Módulo 7 do Plano Mestre).
+enum EnrollmentPhase {
+  CONTEUDO
+  FIXACAO
+  QUIZ
+  RESULTADO
+  ASSINATURA
+  REACAO
+  CONCLUIDO
+}
+
+enum DataRequestKind {
+  EXPORTACAO
+  EXCLUSAO
+}
+
+enum DataRequestStatus {
+  ABERTA
+  EM_ANALISE
+  ATENDIDA
+  RECUSADA
+}
+
+enum MediaKind {
+  IMAGEM
+  VIDEO
+  PDF
+  DOCUMENTO
+  LOGO
+  TEMPLATE_CERTIFICADO
+  ASSINATURA
+}
+
+enum ImportKind {
+  USUARIOS
+  QUESTOES
+  MATRICULAS
+}
+
+enum ImportStatus {
+  PENDENTE
+  PROCESSANDO
+  CONCLUIDO
+  FALHOU
+}
+
+enum ProgressEventType {
+  VIEW_START
+  HEARTBEAT
+  VIEW_END
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TENANT E ACESSO
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Tenant {
+  id          String       @id @default(uuid()) @db.Uuid
+  nome        String
+  razaoSocial String?      @map("razao_social")
+  cnpj        String?      @unique
+  /// Identificador em URL/subdomínio: rpz-transportes
+  slug        String       @unique
+  status      TenantStatus @default(TRIAL)
+  plano       PlanTier     @default(BASICO)
+
+  /// Licenciamento: o limite que vale é o de motoristas ativos.
+  limiteMotoristasAtivos Int @default(50) @map("limite_motoristas_ativos")
+
+  /// Limite de cursos: existe no painel Master mas nasce DESLIGADO (acordo com o cliente).
+  /// Só é aplicado quando `limiteCursosAtivo = true` e `limiteCursos` estiver preenchido.
+  limiteCursosAtivo Boolean @default(false) @map("limite_cursos_ativo")
+  limiteCursos      Int?    @map("limite_cursos")
+
+  emailContato       String? @map("email_contato")
+  telefone           String?
+  logoUrl            String? @map("logo_url")
+  corPrimaria        String? @map("cor_primaria")
+  /// Prefixo do número sequencial de certificado do tenant. Ex.: RPZ
+  prefixoCertificado String? @map("prefixo_certificado")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  users                User[]
+  teams                Team[]
+  trainings            Training[]
+  enrollments          Enrollment[]
+  completions          Completion[]
+  signatures           Signature[]
+  certificates         Certificate[]
+  certificateTemplates CertificateTemplate[]
+  turmas               Turma[]
+  reactionForms        ReactionForm[]
+  efficacyEvaluations  EfficacyEvaluation[]
+  notificationRules    NotificationRule[]
+  notificationLogs     NotificationLog[]
+  auditLogs            AuditLog[]
+  consentDocuments     ConsentDocument[]
+  consentAcceptances   ConsentAcceptance[]
+  dataRequests         DataRequest[]
+  mediaAssets          MediaAsset[]
+  importJobs           ImportJob[]
+  trainingGroups       TrainingGroup[]
+  termTemplates        TermTemplate[]
+  responsibilityTerms  ResponsibilityTerm[]
+  planHistory          PlanHistory[]
+
+  @@index([status])
+  @@map("tenants")
+}
+
+model Team {
+  id        String  @id @default(uuid()) @db.Uuid
+  tenantId  String  @map("tenant_id") @db.Uuid
+  nome      String
+  descricao String?
+  /// Gestor responsável pela equipe (role GESTOR).
+  gestorId  String? @map("gestor_id") @db.Uuid
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  tenant  Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  gestor  User?  @relation("TeamGestor", fields: [gestorId], references: [id], onDelete: SetNull)
+  membros User[] @relation("TeamMembros")
+
+  @@unique([tenantId, nome])
+  @@index([tenantId])
+  @@map("teams")
+}
+
+model User {
+  id       String  @id @default(uuid()) @db.Uuid
+  /// Nulo APENAS para role MASTER (usuário global da plataforma).
+  tenantId String? @map("tenant_id") @db.Uuid
+
+  nome      String
+  /// Global único: o login não precisa saber o tenant de antemão.
+  email     String  @unique
+  cpf       String?
+  telefone  String?
+  matricula String?
+  cargo     String?
+  teamId    String? @map("team_id") @db.Uuid
+
+  senhaHash String  @map("senha_hash")
+  role      Role    @default(COLABORADOR)
+  ativo     Boolean @default(true)
+
+  /// Bloqueio de conta: 5 falhas consecutivas (regra em src/modules/auth).
+  falhasLogin        Int       @default(0) @map("falhas_login")
+  bloqueadoAte       DateTime? @map("bloqueado_ate")
+  ultimoLoginEm      DateTime? @map("ultimo_login_em")
+  precisaTrocarSenha Boolean   @default(true) @map("precisa_trocar_senha")
+
+  /// Módulo 3: "permitir reinício de treinamento" no cadastro do usuário.
+  /// Autorização geral; a autorização pontual fica em Enrollment.reinicioAutorizado.
+  permitirReinicio Boolean @default(false) @map("permitir_reinicio")
+
+  /// Módulo 1: usuário de teste com bypass de anti-skip, liberado só pelo Master.
+  /// Existe para homologar conteúdo sem esperar o tempo mínimo de cada slide.
+  bypassAntiSkip Boolean @default(false) @map("bypass_anti_skip")
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  tenant Tenant? @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  team   Team?   @relation("TeamMembros", fields: [teamId], references: [id], onDelete: SetNull)
+
+  teamsGerenciados Team[] @relation("TeamGestor")
+
+  refreshTokens       RefreshToken[]
+  revokedTokens       RevokedToken[]
+  passwordResetTokens PasswordResetToken[]
+  loginAttempts       LoginAttempt[]
+
+  enrollments              Enrollment[] @relation("EnrollmentAluno")
+  enrollmentsCriadas       Enrollment[] @relation("EnrollmentMatriculadoPor")
+  enrollmentsReautorizadas Enrollment[] @relation("EnrollmentReinicioAutorizadoPor")
+
+  completions           Completion[]
+  signatures            Signature[]
+  certificates          Certificate[] @relation("CertificateTitular")
+  certificadosRevogados Certificate[] @relation("CertificateRevogadoPor")
+
+  trainingsCriados Training[] @relation("TrainingCriadoPor")
+
+  turmasComoInstrutor Turma[]            @relation("TurmaInstrutor")
+  turmasCriadas       Turma[]            @relation("TurmaCriadoPor")
+  turmaParticipacoes  TurmaParticipant[]
+
+  reactionResponses ReactionResponse[]
+
+  efficacyComoColaborador EfficacyEvaluation[] @relation("EfficacyColaborador")
+  efficacyComoAvaliador   EfficacyEvaluation[] @relation("EfficacyAvaliador")
+  efficacyComoResponsavel EfficacyEvaluation[] @relation("EfficacyPlanoResponsavel")
+
+  notificationLogs      NotificationLog[]
+  auditLogs             AuditLog[]
+  consentAcceptances    ConsentAcceptance[]
+  responsibilityTerms   ResponsibilityTerm[]
+  dataRequests          DataRequest[]        @relation("DataRequestTitular")
+  dataRequestsAtendidas DataRequest[]        @relation("DataRequestAtendidaPor")
+  mediaAssets           MediaAsset[]
+  importJobs            ImportJob[]
+
+  @@unique([tenantId, cpf])
+  @@index([tenantId, role])
+  @@index([tenantId, ativo])
+  @@index([cpf])
+  @@map("users")
+}
+
+model RefreshToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  tenantId  String?   @map("tenant_id") @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  /// Guardamos apenas o hash SHA-256 do token, nunca o valor bruto.
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at")
+  revokedAt DateTime? @map("revoked_at")
+  ip        String?
+  userAgent String?   @map("user_agent")
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+  @@map("refresh_tokens")
+}
+
+/// Lista de tokens revogados. Substitui o Redis, que só entra na Fase 2+.
+/// O logout grava o `jti` do access token aqui; o middleware de auth consulta.
+/// Um cron limpa os registros já expirados.
+model RevokedToken {
+  id        String   @id @default(uuid()) @db.Uuid
+  tenantId  String?  @map("tenant_id") @db.Uuid
+  userId    String   @map("user_id") @db.Uuid
+  jti       String   @unique
+  /// Momento em que o access token expiraria naturalmente: depois disso pode sumir.
+  expiresAt DateTime @map("expires_at")
+  revokedAt DateTime @default(now()) @map("revoked_at")
+  motivo    String?
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([expiresAt])
+  @@index([userId])
+  @@map("revoked_tokens")
+}
+
+model PasswordResetToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  tenantId  String?   @map("tenant_id") @db.Uuid
+  userId    String    @map("user_id") @db.Uuid
+  tokenHash String    @unique @map("token_hash")
+  expiresAt DateTime  @map("expires_at")
+  usedAt    DateTime? @map("used_at")
+  ip        String?
+  createdAt DateTime  @default(now()) @map("created_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("password_reset_tokens")
+}
+
+/// Trilha de tentativas de login: alimenta o bloqueio de conta e o rate limiting,
+/// e serve de evidência em auditoria de segurança. Nunca grava a senha.
+model LoginAttempt {
+  id            String   @id @default(uuid()) @db.Uuid
+  tenantId      String?  @map("tenant_id") @db.Uuid
+  userId        String?  @map("user_id") @db.Uuid
+  identificador String   @map("identificador") // e-mail ou CPF digitado
+  sucesso       Boolean
+  motivo        String?
+  ip            String?
+  userAgent     String?  @map("user_agent")
+  createdAt     DateTime @default(now()) @map("created_at")
+
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([identificador, createdAt])
+  @@index([ip, createdAt])
+  @@map("login_attempts")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CATÁLOGO DE TREINAMENTOS
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Training {
+  id       String  @id @default(uuid()) @db.Uuid
+  /// Nulo quando origem = PLATAFORMA (catálogo compartilhado).
+  tenantId String? @map("tenant_id") @db.Uuid
+
+  codigo     String?
+  titulo     String
+  descricao  String?
+  categoria  String?
+  origem     TrainingOrigin @default(PROPRIO)
+  modalidade Modalidade     @default(EAD)
+  status     TrainingStatus @default(RASCUNHO)
+  capaUrl    String?        @map("capa_url")
+
+  cargaHorariaMinutos Int     @default(60) @map("carga_horaria_minutos")
+  /// Nulo = certificado sem validade. Em meses (o plano fala em 1/2/3 anos;
+  /// meses cobre isso e ainda atende reciclagem de NR com prazo menor que um ano).
+  validadeMeses       Int?    @map("validade_meses")
+  notaMinima          Decimal @default(70) @map("nota_minima") @db.Decimal(5, 2)
+  tentativasMaximas   Int     @default(3) @map("tentativas_maximas")
+  obrigatorio         Boolean @default(false)
+
+  /// Módulo 4: instrutor responsável e função-alvo do treinamento.
+  instrutorNome String? @map("instrutor_nome")
+  funcaoAlvo    String? @map("funcao_alvo")
+
+  /// Módulo 4: define se este treinamento exige assinatura digital ao final.
+  exigeAssinatura Boolean @default(true) @map("exige_assinatura")
+
+  /// Módulo 6: quantas questões sortear do pool em cada etapa.
+  qtdQuestoesFixacao Int @default(3) @map("qtd_questoes_fixacao")
+  qtdQuestoesQuiz    Int @default(10) @map("qtd_questoes_quiz")
+
+  /// Módulo 9: certificado só é gerado se houver modelo configurado aqui.
+  certificateTemplateId String? @map("certificate_template_id") @db.Uuid
+
+  /// Módulo 4: grupo de treinamentos que compartilham um termo único no final.
+  trainingGroupId String? @map("training_group_id") @db.Uuid
+  ordemNoGrupo    Int?    @map("ordem_no_grupo")
+
+  /// Anti-skip: quando ligado, o servidor valida o tempo mínimo de cada slide
+  /// comparando timestamps do próprio servidor. Desligado no modo apresentação.
+  antiSkipAtivo Boolean @default(true) @map("anti_skip_ativo")
+
+  /// Extra acordado: aponta para o treinamento do qual este é a reciclagem.
+  /// O painel de vencimentos usa isso para sugerir o curso de reciclagem certo.
+  reciclagemDeId String? @map("reciclagem_de_id") @db.Uuid
+
+  reactionFormId String? @map("reaction_form_id") @db.Uuid
+
+  versao      Int       @default(1)
+  publicadoEm DateTime? @map("publicado_em")
+  criadoPorId String?   @map("criado_por_id") @db.Uuid
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  tenant              Tenant?              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  criadoPor           User?                @relation("TrainingCriadoPor", fields: [criadoPorId], references: [id], onDelete: SetNull)
+  reciclagemDe        Training?            @relation("Reciclagem", fields: [reciclagemDeId], references: [id], onDelete: SetNull)
+  reciclagens         Training[]           @relation("Reciclagem")
+  reactionForm        ReactionForm?        @relation(fields: [reactionFormId], references: [id], onDelete: SetNull)
+  certificateTemplate CertificateTemplate? @relation("TrainingTemplatePadrao", fields: [certificateTemplateId], references: [id], onDelete: SetNull)
+  trainingGroup       TrainingGroup?       @relation("TrainingGroupItens", fields: [trainingGroupId], references: [id], onDelete: SetNull)
+  fechaGrupo          TrainingGroup?       @relation("TrainingGroupUltimo")
+
+  lessons             Lesson[]
+  questions           Question[]
+  enrollments         Enrollment[]
+  completions         Completion[]
+  certificates        Certificate[]
+  turmas              Turma[]
+  efficacyEvaluations EfficacyEvaluation[]
+  reactionResponses   ReactionResponse[]
+
+  @@unique([tenantId, codigo])
+  @@index([tenantId, status])
+  @@index([tenantId, modalidade])
+  @@index([reciclagemDeId])
+  @@map("trainings")
+}
+
+model Lesson {
+  id         String  @id @default(uuid()) @db.Uuid
+  tenantId   String? @map("tenant_id") @db.Uuid
+  trainingId String  @map("training_id") @db.Uuid
+
+  titulo    String
+  descricao String?
+  ordem     Int
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  training  Training   @relation(fields: [trainingId], references: [id], onDelete: Cascade)
+  slides    Slide[]
+  questions Question[]
+
+  @@unique([trainingId, ordem])
+  @@index([tenantId])
+  @@map("lessons")
+}
+
+model Slide {
+  id       String  @id @default(uuid()) @db.Uuid
+  tenantId String? @map("tenant_id") @db.Uuid
+  lessonId String  @map("lesson_id") @db.Uuid
+
+  ordem    Int
+  tipo     SlideType @default(TEXTO)
+  titulo   String?
+  /// Blocos do construtor drag-and-drop, versionáveis sem migration.
+  conteudo Json      @default("{}")
+  mediaUrl String?   @map("media_url")
+
+  /// Anti-skip: tempo mínimo de permanência exigido, validado no servidor.
+  tempoMinimoSegundos Int @default(0) @map("tempo_minimo_segundos")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  lesson   Lesson          @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+  progress SlideProgress[]
+  events   ProgressEvent[]
+
+  @@unique([lessonId, ordem])
+  @@index([tenantId])
+  @@map("slides")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BANCO DE QUESTÕES
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Question {
+  id         String  @id @default(uuid()) @db.Uuid
+  tenantId   String? @map("tenant_id") @db.Uuid
+  trainingId String  @map("training_id") @db.Uuid
+  /// Preenchido quando é questão de fixação de uma aula específica.
+  lessonId   String? @map("lesson_id") @db.Uuid
+
+  tipo       QuestionKind   @default(PROVA_FINAL)
+  formato    QuestionFormat @default(MULTIPLA_ESCOLHA)
+  /// Módulo 6: pool de fixação é organizado por BLOCO de aulas, não por aula solta.
+  /// Um bloco agrupa uma ou mais aulas e dispara a fixação ao terminar.
+  blocoAula  Int?           @map("bloco_aula")
+  enunciado  String
+  /// Texto mostrado no feedback imediato (fixação) e no gabarito em PDF.
+  explicacao String?
+  peso       Decimal        @default(1) @db.Decimal(5, 2)
+  ordem      Int?
+  ativa      Boolean        @default(true)
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  updatedAt DateTime  @updatedAt @map("updated_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  training Training          @relation(fields: [trainingId], references: [id], onDelete: Cascade)
+  lesson   Lesson?           @relation(fields: [lessonId], references: [id], onDelete: SetNull)
+  opcoes   QuestionOption[]
+  attempts QuestionAttempt[]
+
+  @@index([tenantId])
+  @@index([trainingId, tipo, ativa])
+  @@map("questions")
+}
+
+model QuestionOption {
+  id         String  @id @default(uuid()) @db.Uuid
+  tenantId   String? @map("tenant_id") @db.Uuid
+  questionId String  @map("question_id") @db.Uuid
+
+  texto   String
+  correta Boolean @default(false)
+  ordem   Int
+
+  question Question          @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  attempts QuestionAttempt[]
+
+  @@unique([questionId, ordem])
+  @@index([tenantId])
+  @@map("question_options")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MATRÍCULA, PROGRESSO E AVALIAÇÃO
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Enrollment {
+  id         String  @id @default(uuid()) @db.Uuid
+  tenantId   String  @map("tenant_id") @db.Uuid
+  userId     String  @map("user_id") @db.Uuid
+  trainingId String  @map("training_id") @db.Uuid
+  turmaId    String? @map("turma_id") @db.Uuid
+
+  /// Ciclo 1 = primeira vez; incrementa a cada reciclagem do mesmo treinamento.
+  ciclo  Int              @default(1)
+  status EnrollmentStatus @default(NAO_INICIADO)
+  origem CompletionOrigin @default(EAD)
+  /// Guard de fases (Módulo 7): impede pular direto pro quiz ou refazer etapa concluída.
+  fase   EnrollmentPhase  @default(CONTEUDO)
+
+  matriculadoPorId String?   @map("matriculado_por_id") @db.Uuid
+  matriculadoEm    DateTime  @default(now()) @map("matriculado_em")
+  prazoEm          DateTime? @map("prazo_em")
+  iniciadoEm       DateTime? @map("iniciado_em")
+  concluidoEm      DateTime? @map("concluido_em")
+  expiraEm         DateTime? @map("expira_em")
+
+  progressoPercentual Decimal @default(0) @map("progresso_percentual") @db.Decimal(5, 2)
+  ultimoSlideId       String? @map("ultimo_slide_id") @db.Uuid
+  tentativas          Int     @default(0)
+
+  /// Flag de reinício autorizado pelo RH (Plano Mestre, motor de treinamento).
+  reinicioAutorizado      Boolean   @default(false) @map("reinicio_autorizado")
+  reinicioAutorizadoPorId String?   @map("reinicio_autorizado_por_id") @db.Uuid
+  reinicioAutorizadoEm    DateTime? @map("reinicio_autorizado_em")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant                Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user                  User     @relation("EnrollmentAluno", fields: [userId], references: [id], onDelete: Cascade)
+  training              Training @relation(fields: [trainingId], references: [id], onDelete: Cascade)
+  turma                 Turma?   @relation(fields: [turmaId], references: [id], onDelete: SetNull)
+  matriculadoPor        User?    @relation("EnrollmentMatriculadoPor", fields: [matriculadoPorId], references: [id], onDelete: SetNull)
+  reinicioAutorizadoPor User?    @relation("EnrollmentReinicioAutorizadoPor", fields: [reinicioAutorizadoPorId], references: [id], onDelete: SetNull)
+
+  slideProgress    SlideProgress[]
+  progressEvents   ProgressEvent[]
+  quizAttempts     QuizAttempt[]
+  completion       Completion?
+  signatures       Signature[]
+  reactionResponse ReactionResponse?
+
+  @@unique([tenantId, userId, trainingId, ciclo])
+  @@index([tenantId, status])
+  @@index([tenantId, userId])
+  @@index([tenantId, expiraEm])
+  @@map("enrollments")
+}
+
+model SlideProgress {
+  id           String  @id @default(uuid()) @db.Uuid
+  tenantId     String? @map("tenant_id") @db.Uuid
+  enrollmentId String  @map("enrollment_id") @db.Uuid
+  slideId      String  @map("slide_id") @db.Uuid
+
+  /// Somatório validado no servidor a partir dos heartbeats, nunca do que o front informa.
+  tempoAcumuladoSegundos Int       @default(0) @map("tempo_acumulado_segundos")
+  primeiroAcessoEm       DateTime  @default(now()) @map("primeiro_acesso_em")
+  ultimoAcessoEm         DateTime  @updatedAt @map("ultimo_acesso_em")
+  concluidoEm            DateTime? @map("concluido_em")
+
+  enrollment Enrollment @relation(fields: [enrollmentId], references: [id], onDelete: Cascade)
+  slide      Slide      @relation(fields: [slideId], references: [id], onDelete: Cascade)
+
+  @@unique([enrollmentId, slideId])
+  @@index([tenantId])
+  @@map("slide_progress")
+}
+
+/// Trilha bruta do anti-skip. É o que torna a conclusão à prova de contestação:
+/// cada marco tem o timestamp do SERVIDOR, não o do navegador.
+model ProgressEvent {
+  id            String            @id @default(uuid()) @db.Uuid
+  tenantId      String?           @map("tenant_id") @db.Uuid
+  enrollmentId  String            @map("enrollment_id") @db.Uuid
+  slideId       String            @map("slide_id") @db.Uuid
+  tipo          ProgressEventType
+  /// Segundos creditados neste evento, já limitados pelo servidor.
+  deltaSegundos Int               @default(0) @map("delta_segundos")
+  servidorEm    DateTime          @default(now()) @map("servidor_em")
+  ip            String?
+  userAgent     String?           @map("user_agent")
+
+  enrollment Enrollment @relation(fields: [enrollmentId], references: [id], onDelete: Cascade)
+  slide      Slide      @relation(fields: [slideId], references: [id], onDelete: Cascade)
+
+  @@index([enrollmentId, servidorEm])
+  @@index([tenantId])
+  @@map("progress_events")
+}
+
+model QuizAttempt {
+  id           String        @id @default(uuid()) @db.Uuid
+  tenantId     String?       @map("tenant_id") @db.Uuid
+  enrollmentId String        @map("enrollment_id") @db.Uuid
+  tipo         QuestionKind  @default(PROVA_FINAL)
+  /// Número da tentativa dentro da matrícula.
+  numero       Int
+  status       AttemptStatus @default(EM_ANDAMENTO)
+
+  /// Semente do Fisher-Yates: permite reproduzir a ordem exata que o aluno viu.
+  seed String
+
+  nota     Decimal? @db.Decimal(5, 2)
+  aprovado Boolean?
+
+  iniciadoEm   DateTime  @default(now()) @map("iniciado_em")
+  finalizadoEm DateTime? @map("finalizado_em")
+  ip           String?
+  userAgent    String?   @map("user_agent")
+
+  enrollment Enrollment        @relation(fields: [enrollmentId], references: [id], onDelete: Cascade)
+  respostas  QuestionAttempt[]
+
+  @@unique([enrollmentId, tipo, numero])
+  @@index([tenantId])
+  @@map("quiz_attempts")
+}
+
+model QuestionAttempt {
+  id            String  @id @default(uuid()) @db.Uuid
+  tenantId      String? @map("tenant_id") @db.Uuid
+  quizAttemptId String  @map("quiz_attempt_id") @db.Uuid
+  questionId    String  @map("question_id") @db.Uuid
+  optionId      String? @map("option_id") @db.Uuid
+
+  respostaTexto String?  @map("resposta_texto")
+  correta       Boolean  @default(false)
+  tempoSegundos Int      @default(0) @map("tempo_segundos")
+  respondidoEm  DateTime @default(now()) @map("respondido_em")
+
+  quizAttempt QuizAttempt     @relation(fields: [quizAttemptId], references: [id], onDelete: Cascade)
+  question    Question        @relation(fields: [questionId], references: [id], onDelete: Cascade)
+  opcao       QuestionOption? @relation(fields: [optionId], references: [id], onDelete: SetNull)
+
+  @@unique([quizAttemptId, questionId])
+  @@index([tenantId])
+  @@map("question_attempts")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CONCLUSÃO, ASSINATURA E CERTIFICADO
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Completion {
+  id           String  @id @default(uuid()) @db.Uuid
+  tenantId     String  @map("tenant_id") @db.Uuid
+  enrollmentId String  @unique @map("enrollment_id") @db.Uuid
+  userId       String  @map("user_id") @db.Uuid
+  trainingId   String  @map("training_id") @db.Uuid
+  turmaId      String? @map("turma_id") @db.Uuid
+
+  origem              CompletionOrigin @default(EAD)
+  nota                Decimal?         @db.Decimal(5, 2)
+  cargaHorariaMinutos Int              @map("carga_horaria_minutos")
+  concluidoEm         DateTime         @default(now()) @map("concluido_em")
+  validoAte           DateTime?        @map("valido_ate")
+  assinaturaId        String?          @unique @map("assinatura_id") @db.Uuid
+
+  /// Módulo 9: PDF do gabarito das respostas, gerado em toda conclusão.
+  gabaritoUrl String? @map("gabarito_url")
+  /// Aceite do termo registrado no momento da conclusão (Módulo 9).
+  aceite      Boolean @default(false)
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant     Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  enrollment Enrollment @relation(fields: [enrollmentId], references: [id], onDelete: Cascade)
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  training   Training   @relation(fields: [trainingId], references: [id], onDelete: Cascade)
+  turma      Turma?     @relation(fields: [turmaId], references: [id], onDelete: SetNull)
+  assinatura Signature? @relation(fields: [assinaturaId], references: [id], onDelete: SetNull)
+
+  certificate        Certificate?
+  efficacyEvaluation EfficacyEvaluation?
+  responsibilityTerm ResponsibilityTerm?
+
+  @@index([tenantId, concluidoEm])
+  @@index([tenantId, validoAte])
+  @@map("completions")
+}
+
+/// Assinatura digital em canvas. Usada tanto na conclusão EAD quanto na
+/// confirmação de presença do presencial (mesmo fluxo, mesma evidência).
+model Signature {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+  userId   String @map("user_id") @db.Uuid
+
+  enrollmentId String? @map("enrollment_id") @db.Uuid
+
+  /// PNG do traço, no storage. Nunca inline no banco.
+  imagemUrl  String   @map("imagem_url")
+  /// SHA-256 da imagem + userId + timestamp: detecta adulteração posterior.
+  hash       String
+  assinadoEm DateTime @default(now()) @map("assinado_em")
+  ip         String?
+  userAgent  String?  @map("user_agent")
+
+  tenant     Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user       User        @relation(fields: [userId], references: [id], onDelete: Cascade)
+  enrollment Enrollment? @relation(fields: [enrollmentId], references: [id], onDelete: SetNull)
+
+  completion         Completion?
+  turmaParticipant   TurmaParticipant?
+  responsibilityTerm ResponsibilityTerm?
+
+  @@index([tenantId, userId])
+  @@map("signatures")
+}
+
+model CertificateTemplate {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+
+  nome       String
+  /// PDF base enviado pelo cliente.
+  arquivoUrl String  @map("arquivo_url")
+  /// Posição/estilo de cada variável. Conjunto do Módulo 9 do Plano Mestre:
+  /// {{NOME}}, {{CPF}}, {{TREINAMENTO}}, {{DATA}}, {{DATA_EXTENSO}}, {{CARGA_HORARIA}},
+  /// {{VALIDADE}}, {{NOTA}}, {{PERCENTUAL}}, {{INSTRUTOR}}, {{FUNCAO}}.
+  /// Acrescentados por necessidade da verificação pública: {{CODIGO}}, {{QRCODE}}, {{ASSINATURA}}.
+  mapeamento Json    @default("{}")
+  padrao     Boolean @default(false)
+  ativo      Boolean @default(true)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant       Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  certificates Certificate[]
+  trainings    Training[]    @relation("TrainingTemplatePadrao")
+
+  @@index([tenantId])
+  @@map("certificate_templates")
+}
+
+model Certificate {
+  id           String  @id @default(uuid()) @db.Uuid
+  tenantId     String  @map("tenant_id") @db.Uuid
+  completionId String  @unique @map("completion_id") @db.Uuid
+  userId       String  @map("user_id") @db.Uuid
+  trainingId   String  @map("training_id") @db.Uuid
+  templateId   String? @map("template_id") @db.Uuid
+
+  /// Código público impresso no PDF e embutido no QR. Sem login para conferir.
+  codigo String @unique
+  /// Numeração sequencial legível por tenant. Ex.: RPZ-2026-000123
+  numero String
+
+  arquivoUrl String @map("arquivo_url")
+  /// SHA-256 do PDF emitido: prova de integridade na verificação pública.
+  hash       String
+
+  status    CertificateStatus @default(VALIDO)
+  emitidoEm DateTime          @default(now()) @map("emitido_em")
+  validoAte DateTime?         @map("valido_ate")
+
+  revogadoEm      DateTime? @map("revogado_em")
+  revogadoPorId   String?   @map("revogado_por_id") @db.Uuid
+  motivoRevogacao String?   @map("motivo_revogacao")
+
+  verificacoes Int @default(0)
+
+  tenant      Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  completion  Completion           @relation(fields: [completionId], references: [id], onDelete: Cascade)
+  user        User                 @relation("CertificateTitular", fields: [userId], references: [id], onDelete: Cascade)
+  training    Training             @relation(fields: [trainingId], references: [id], onDelete: Cascade)
+  template    CertificateTemplate? @relation(fields: [templateId], references: [id], onDelete: SetNull)
+  revogadoPor User?                @relation("CertificateRevogadoPor", fields: [revogadoPorId], references: [id], onDelete: SetNull)
+
+  verificacoesLog CertificateVerification[]
+
+  @@unique([tenantId, numero])
+  @@index([tenantId, status])
+  @@index([tenantId, validoAte])
+  @@map("certificates")
+}
+
+/// Log da página pública de verificação (sem login). Serve de métrica comercial
+/// e de evidência de que o certificado foi conferido por um fiscal/cliente.
+model CertificateVerification {
+  id            String   @id @default(uuid()) @db.Uuid
+  certificateId String   @map("certificate_id") @db.Uuid
+  verificadoEm  DateTime @default(now()) @map("verificado_em")
+  ip            String?
+  userAgent     String?  @map("user_agent")
+
+  certificate Certificate @relation(fields: [certificateId], references: [id], onDelete: Cascade)
+
+  @@index([certificateId, verificadoEm])
+  @@map("certificate_verifications")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PRESENCIAL (extra acordado, v1)
+// ─────────────────────────────────────────────────────────────────────────────
+
+model Turma {
+  id         String @id @default(uuid()) @db.Uuid
+  tenantId   String @map("tenant_id") @db.Uuid
+  trainingId String @map("training_id") @db.Uuid
+
+  codigo        String?
+  titulo        String
+  /// Instrutor interno (usuário da plataforma) OU nome livre de instrutor externo.
+  instrutorId   String? @map("instrutor_id") @db.Uuid
+  instrutorNome String? @map("instrutor_nome")
+  local         String?
+
+  dataInicio          DateTime    @map("data_inicio")
+  dataFim             DateTime?   @map("data_fim")
+  cargaHorariaMinutos Int?        @map("carga_horaria_minutos")
+  vagas               Int?
+  status              TurmaStatus @default(AGENDADA)
+  observacoes         String?
+
+  criadoPorId String? @map("criado_por_id") @db.Uuid
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant    Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  training  Training @relation(fields: [trainingId], references: [id], onDelete: Cascade)
+  instrutor User?    @relation("TurmaInstrutor", fields: [instrutorId], references: [id], onDelete: SetNull)
+  criadoPor User?    @relation("TurmaCriadoPor", fields: [criadoPorId], references: [id], onDelete: SetNull)
+
+  participantes TurmaParticipant[]
+  enrollments   Enrollment[]
+  completions   Completion[]
+
+  @@unique([tenantId, codigo])
+  @@index([tenantId, status])
+  @@index([tenantId, dataInicio])
+  @@map("turmas")
+}
+
+model TurmaParticipant {
+  id       String  @id @default(uuid()) @db.Uuid
+  tenantId String? @map("tenant_id") @db.Uuid
+  turmaId  String  @map("turma_id") @db.Uuid
+  userId   String  @map("user_id") @db.Uuid
+
+  presenca     AttendanceStatus @default(AUSENTE)
+  confirmadoEm DateTime?        @map("confirmado_em")
+  /// Presença confirmada pela mesma assinatura digital usada no EAD.
+  assinaturaId String?          @unique @map("assinatura_id") @db.Uuid
+  observacao   String?
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  turma      Turma      @relation(fields: [turmaId], references: [id], onDelete: Cascade)
+  user       User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  assinatura Signature? @relation(fields: [assinaturaId], references: [id], onDelete: SetNull)
+
+  @@unique([turmaId, userId])
+  @@index([tenantId])
+  @@map("turma_participants")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AVALIAÇÃO DE REAÇÃO E DE EFICÁCIA
+// ─────────────────────────────────────────────────────────────────────────────
+
+model ReactionForm {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+
+  nome      String
+  descricao String?
+  ativo     Boolean @default(true)
+  padrao    Boolean @default(false)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant    Tenant             @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  questoes  ReactionQuestion[]
+  respostas ReactionResponse[]
+  trainings Training[]
+
+  @@index([tenantId])
+  @@map("reaction_forms")
+}
+
+model ReactionQuestion {
+  id       String  @id @default(uuid()) @db.Uuid
+  tenantId String? @map("tenant_id") @db.Uuid
+  formId   String  @map("form_id") @db.Uuid
+
+  /// Uma das 13 categorias do Plano Mestre (conteúdo, instrutor, material, ...).
+  categoria   String
+  texto       String
+  escala      ReactionScale @default(LIKERT_5)
+  obrigatoria Boolean       @default(true)
+  ordem       Int
+
+  form      ReactionForm     @relation(fields: [formId], references: [id], onDelete: Cascade)
+  respostas ReactionAnswer[]
+
+  @@unique([formId, ordem])
+  @@index([tenantId])
+  @@map("reaction_questions")
+}
+
+model ReactionResponse {
+  id           String  @id @default(uuid()) @db.Uuid
+  tenantId     String? @map("tenant_id") @db.Uuid
+  formId       String  @map("form_id") @db.Uuid
+  enrollmentId String  @unique @map("enrollment_id") @db.Uuid
+  userId       String  @map("user_id") @db.Uuid
+  trainingId   String  @map("training_id") @db.Uuid
+
+  respondidoEm DateTime @default(now()) @map("respondido_em")
+
+  form       ReactionForm     @relation(fields: [formId], references: [id], onDelete: Cascade)
+  enrollment Enrollment       @relation(fields: [enrollmentId], references: [id], onDelete: Cascade)
+  user       User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  training   Training         @relation(fields: [trainingId], references: [id], onDelete: Cascade)
+  respostas  ReactionAnswer[]
+
+  @@index([tenantId, trainingId])
+  @@map("reaction_responses")
+}
+
+model ReactionAnswer {
+  id         String  @id @default(uuid()) @db.Uuid
+  tenantId   String? @map("tenant_id") @db.Uuid
+  responseId String  @map("response_id") @db.Uuid
+  questionId String  @map("question_id") @db.Uuid
+
+  valorNumerico Int?    @map("valor_numerico")
+  valorTexto    String? @map("valor_texto")
+
+  response ReactionResponse @relation(fields: [responseId], references: [id], onDelete: Cascade)
+  question ReactionQuestion @relation(fields: [questionId], references: [id], onDelete: Cascade)
+
+  @@unique([responseId, questionId])
+  @@index([tenantId])
+  @@map("reaction_answers")
+}
+
+/// Avaliação de eficácia: o GESTOR avalia o colaborador de 30 a 90 dias depois
+/// da conclusão. Resultado insatisfatório abre plano de ação.
+model EfficacyEvaluation {
+  id            String  @id @default(uuid()) @db.Uuid
+  tenantId      String  @map("tenant_id") @db.Uuid
+  completionId  String  @unique @map("completion_id") @db.Uuid
+  colaboradorId String  @map("colaborador_id") @db.Uuid
+  avaliadorId   String? @map("avaliador_id") @db.Uuid
+  trainingId    String  @map("training_id") @db.Uuid
+
+  janelaDias   Int            @default(60) @map("janela_dias")
+  disponivelEm DateTime       @map("disponivel_em")
+  prazoEm      DateTime?      @map("prazo_em")
+  status       EfficacyStatus @default(PENDENTE)
+  respondidoEm DateTime?      @map("respondido_em")
+
+  notaGeral Decimal?        @map("nota_geral") @db.Decimal(5, 2)
+  resultado EfficacyResult?
+
+  planoAcao              String?   @map("plano_acao")
+  planoAcaoPrazo         DateTime? @map("plano_acao_prazo")
+  planoAcaoResponsavelId String?   @map("plano_acao_responsavel_id") @db.Uuid
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant               Tenant     @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  completion           Completion @relation(fields: [completionId], references: [id], onDelete: Cascade)
+  colaborador          User       @relation("EfficacyColaborador", fields: [colaboradorId], references: [id], onDelete: Cascade)
+  avaliador            User?      @relation("EfficacyAvaliador", fields: [avaliadorId], references: [id], onDelete: SetNull)
+  training             Training   @relation(fields: [trainingId], references: [id], onDelete: Cascade)
+  planoAcaoResponsavel User?      @relation("EfficacyPlanoResponsavel", fields: [planoAcaoResponsavelId], references: [id], onDelete: SetNull)
+
+  respostas EfficacyAnswer[]
+
+  @@index([tenantId, status])
+  @@index([tenantId, disponivelEm])
+  @@map("efficacy_evaluations")
+}
+
+model EfficacyAnswer {
+  id           String  @id @default(uuid()) @db.Uuid
+  tenantId     String? @map("tenant_id") @db.Uuid
+  evaluationId String  @map("evaluation_id") @db.Uuid
+
+  /// Um dos 6 blocos do Plano Mestre.
+  bloco      String
+  questao    String
+  valor      Int
+  comentario String?
+
+  evaluation EfficacyEvaluation @relation(fields: [evaluationId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@map("efficacy_answers")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NOTIFICAÇÕES
+// ─────────────────────────────────────────────────────────────────────────────
+
+model NotificationRule {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+
+  evento NotificationEvent
+  canal  NotificationChannel
+  ativo  Boolean             @default(true)
+
+  /// Deslocamento em dias em relação ao evento. Negativo = antes.
+  /// Ex.: -30 em VENCIMENTO_PROXIMO avisa 30 dias antes de vencer.
+  offsetDias Int    @default(0) @map("offset_dias")
+  horaEnvio  String @default("08:00") @map("hora_envio")
+
+  /// ["COLABORADOR","GESTOR","ADMIN"]
+  destinatarios Json @default("[\"COLABORADOR\"]")
+
+  templateAssunto String? @map("template_assunto")
+  templateCorpo   String  @map("template_corpo")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  logs   NotificationLog[]
+
+  @@unique([tenantId, evento, canal, offsetDias])
+  @@index([tenantId, ativo])
+  @@map("notification_rules")
+}
+
+model NotificationLog {
+  id       String  @id @default(uuid()) @db.Uuid
+  tenantId String  @map("tenant_id") @db.Uuid
+  ruleId   String? @map("rule_id") @db.Uuid
+
+  evento          NotificationEvent
+  canal           NotificationChannel
+  destinatarioId  String?             @map("destinatario_id") @db.Uuid
+  destinoEndereco String              @map("destino_endereco")
+
+  assunto String?
+  corpo   String
+
+  status            NotificationStatus @default(PENDENTE)
+  tentativas        Int                @default(0)
+  erro              String?
+  agendadoPara      DateTime           @map("agendado_para")
+  enviadoEm         DateTime?          @map("enviado_em")
+  providerMessageId String?            @map("provider_message_id")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant       Tenant            @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  rule         NotificationRule? @relation(fields: [ruleId], references: [id], onDelete: SetNull)
+  destinatario User?             @relation(fields: [destinatarioId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, status, agendadoPara])
+  @@index([destinatarioId])
+  @@map("notification_logs")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// AUDITORIA E LGPD
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Log imutável. A migration aplica trigger que bloqueia UPDATE e DELETE:
+/// a aplicação só tem permissão de INSERT e SELECT. Retenção de 5 anos.
+model AuditLog {
+  id       String  @id @default(uuid()) @db.Uuid
+  tenantId String? @map("tenant_id") @db.Uuid
+  userId   String? @map("user_id") @db.Uuid
+
+  acao       String
+  entidade   String
+  entidadeId String? @map("entidade_id")
+  /// Estado anterior e posterior, já com CPF/senha removidos pelo sanitizador.
+  antes      Json?
+  depois     Json?
+
+  ip        String?
+  userAgent String?  @map("user_agent")
+  criadoEm  DateTime @default(now()) @map("criado_em")
+
+  tenant Tenant? @relation(fields: [tenantId], references: [id], onDelete: SetNull)
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, criadoEm])
+  @@index([entidade, entidadeId])
+  @@index([userId, criadoEm])
+  @@map("audit_logs")
+}
+
+/// Documento de consentimento LGPD (Termos de Uso, Política de Privacidade).
+/// Renomeado de propósito: o Plano Mestre chama de `term_groups` uma coisa
+/// COMPLETAMENTE diferente (grupos de treinamento com termo único), que aqui
+/// vive em TrainingGroup. Os dois existem, e não são a mesma feature.
+model ConsentDocument {
+  id       String  @id @default(uuid()) @db.Uuid
+  /// Nulo = documento global da plataforma; preenchido = documento próprio do tenant.
+  tenantId String? @map("tenant_id") @db.Uuid
+
+  nome  String
+  tipo  ConsentKind
+  ativo Boolean     @default(true)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant  Tenant?          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  versoes ConsentVersion[]
+
+  @@index([tenantId, tipo])
+  @@map("consent_documents")
+}
+
+model ConsentVersion {
+  id         String  @id @default(uuid()) @db.Uuid
+  tenantId   String? @map("tenant_id") @db.Uuid
+  documentId String  @map("document_id") @db.Uuid
+
+  versao      String
+  conteudo    String
+  obrigatorio Boolean   @default(true)
+  publicadoEm DateTime? @map("publicado_em")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  document ConsentDocument     @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  aceites  ConsentAcceptance[]
+
+  @@unique([documentId, versao])
+  @@index([tenantId])
+  @@map("consent_versions")
+}
+
+/// Consentimento LGPD: registrado no primeiro acesso, com data e IP.
+model ConsentAcceptance {
+  id               String @id @default(uuid()) @db.Uuid
+  tenantId         String @map("tenant_id") @db.Uuid
+  userId           String @map("user_id") @db.Uuid
+  consentVersionId String @map("consent_version_id") @db.Uuid
+
+  aceitoEm  DateTime @default(now()) @map("aceito_em")
+  ip        String?
+  userAgent String?  @map("user_agent")
+
+  tenant         Tenant         @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user           User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  consentVersion ConsentVersion @relation(fields: [consentVersionId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, consentVersionId])
+  @@index([tenantId])
+  @@map("consent_acceptances")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GRUPOS DE TREINAMENTO E TERMO DE RESPONSABILIDADE (Módulos 4 e 9)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// O Plano Mestre chama esta tabela de `term_groups`. O nome engana: não é sobre
+/// termos de uso, é sobre agrupar treinamentos que compartilham UM único termo de
+/// responsabilidade, emitido só quando o colaborador conclui o último do grupo.
+/// É o que sustenta a rota GET /api/v1/trainings/:id/is-last.
+model TrainingGroup {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+
+  nome      String
+  descricao String?
+  ativo     Boolean @default(true)
+
+  /// Treinamento que fecha o grupo. Concluído ele, gera-se o termo único.
+  /// Se nulo, vale o maior `ordemNoGrupo` entre os treinamentos do grupo.
+  ultimoTrainingId String? @unique @map("ultimo_training_id") @db.Uuid
+
+  termTemplateId String? @map("term_template_id") @db.Uuid
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant         Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  ultimoTraining Training?     @relation("TrainingGroupUltimo", fields: [ultimoTrainingId], references: [id], onDelete: SetNull)
+  termTemplate   TermTemplate? @relation(fields: [termTemplateId], references: [id], onDelete: SetNull)
+
+  trainings Training[]           @relation("TrainingGroupItens")
+  termos    ResponsibilityTerm[]
+
+  @@unique([tenantId, nome])
+  @@index([tenantId, ativo])
+  @@map("training_groups")
+}
+
+/// Modelo de termo de responsabilidade enviado pela empresa, com variáveis.
+model TermTemplate {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+
+  nome       String
+  tipo       TermTemplateKind @default(DIGITAL)
+  arquivoUrl String           @map("arquivo_url")
+  mapeamento Json             @default("{}")
+  ativo      Boolean          @default(true)
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tenant Tenant               @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  grupos TrainingGroup[]
+  termos ResponsibilityTerm[]
+
+  @@index([tenantId, tipo])
+  @@map("term_templates")
+}
+
+/// Termo de responsabilidade emitido: cobre todos os treinamentos do grupo e é
+/// gerado na conclusão do último. Assinado com o mesmo fluxo de assinatura do EAD.
+model ResponsibilityTerm {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+  userId   String @map("user_id") @db.Uuid
+
+  trainingGroupId String  @map("training_group_id") @db.Uuid
+  templateId      String? @map("template_id") @db.Uuid
+  /// Conclusão que fechou o grupo e disparou a emissão.
+  completionId    String? @unique @map("completion_id") @db.Uuid
+  assinaturaId    String? @unique @map("assinatura_id") @db.Uuid
+
+  arquivoUrl String   @map("arquivo_url")
+  hash       String
+  emitidoEm  DateTime @default(now()) @map("emitido_em")
+  ip         String?
+  userAgent  String?  @map("user_agent")
+
+  tenant        Tenant        @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user          User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  trainingGroup TrainingGroup @relation(fields: [trainingGroupId], references: [id], onDelete: Cascade)
+  template      TermTemplate? @relation(fields: [templateId], references: [id], onDelete: SetNull)
+  completion    Completion?   @relation(fields: [completionId], references: [id], onDelete: SetNull)
+  assinatura    Signature?    @relation(fields: [assinaturaId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, userId])
+  @@map("responsibility_terms")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CONFIGURAÇÃO GLOBAL E HISTÓRICO DE PLANO (Módulos 2 e 14)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Configuração global editável pelo Master (Módulo 14): regras de senha,
+/// expiração de token e limites. Linha única, id fixo "global".
+model SystemConfig {
+  id String @id @default("global")
+
+  jwtExpiracaoHoras    Int @default(8) @map("jwt_expiracao_horas")
+  refreshExpiracaoDias Int @default(30) @map("refresh_expiracao_dias")
+
+  maxTentativasLogin Int @default(5) @map("max_tentativas_login")
+  bloqueioMinutos    Int @default(30) @map("bloqueio_minutos")
+
+  senhaMinCaracteres  Int     @default(8) @map("senha_min_caracteres")
+  senhaExigeMaiuscula Boolean @default(true) @map("senha_exige_maiuscula")
+  senhaExigeNumero    Boolean @default(true) @map("senha_exige_numero")
+  senhaExigeSimbolo   Boolean @default(false) @map("senha_exige_simbolo")
+
+  /// Dias antes do vencimento que acendem o alerta visual no painel.
+  alertaVencimentoDias Int @default(30) @map("alerta_vencimento_dias")
+
+  atualizadoPorId String?  @map("atualizado_por_id") @db.Uuid
+  updatedAt       DateTime @updatedAt @map("updated_at")
+
+  @@map("system_config")
+}
+
+/// Histórico de upgrade/downgrade de plano por empresa (Módulo 2).
+model PlanHistory {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+
+  planoAnterior  PlanTier? @map("plano_anterior")
+  planoNovo      PlanTier  @map("plano_novo")
+  limiteAnterior Int?      @map("limite_anterior")
+  limiteNovo     Int       @map("limite_novo")
+
+  motivo        String?
+  alteradoPorId String?  @map("alterado_por_id") @db.Uuid
+  criadoEm      DateTime @default(now()) @map("criado_em")
+
+  tenant Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId, criadoEm])
+  @@map("plan_history")
+}
+
+/// Portabilidade e exclusão de dados (direitos do titular, LGPD art. 18).
+model DataRequest {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+  userId   String @map("user_id") @db.Uuid
+
+  tipo          DataRequestKind
+  status        DataRequestStatus @default(ABERTA)
+  motivo        String?
+  arquivoUrl    String?           @map("arquivo_url")
+  solicitadoEm  DateTime          @default(now()) @map("solicitado_em")
+  atendidoEm    DateTime?         @map("atendido_em")
+  atendidoPorId String?           @map("atendido_por_id") @db.Uuid
+  observacao    String?
+
+  tenant      Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  user        User   @relation("DataRequestTitular", fields: [userId], references: [id], onDelete: Cascade)
+  atendidoPor User?  @relation("DataRequestAtendidaPor", fields: [atendidoPorId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, status])
+  @@map("data_requests")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ARQUIVOS E IMPORTAÇÕES
+// ─────────────────────────────────────────────────────────────────────────────
+
+model MediaAsset {
+  id       String  @id @default(uuid()) @db.Uuid
+  tenantId String? @map("tenant_id") @db.Uuid
+
+  tipo         MediaKind
+  nomeOriginal String    @map("nome_original")
+  /// Chave no storage S3-compatível.
+  chave        String    @unique
+  url          String
+  mimeType     String    @map("mime_type")
+  tamanhoBytes Int       @map("tamanho_bytes")
+  hash         String?
+
+  enviadoPorId String? @map("enviado_por_id") @db.Uuid
+
+  createdAt DateTime  @default(now()) @map("created_at")
+  deletedAt DateTime? @map("deleted_at")
+
+  tenant     Tenant? @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  enviadoPor User?   @relation(fields: [enviadoPorId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, tipo])
+  @@map("media_assets")
+}
+
+model ImportJob {
+  id       String @id @default(uuid()) @db.Uuid
+  tenantId String @map("tenant_id") @db.Uuid
+
+  tipo       ImportKind
+  status     ImportStatus @default(PENDENTE)
+  arquivoUrl String       @map("arquivo_url")
+
+  totalLinhas Int  @default(0) @map("total_linhas")
+  sucesso     Int  @default(0)
+  erros       Int  @default(0)
+  /// Relatório linha a linha, para o usuário baixar e corrigir.
+  relatorio   Json @default("[]")
+
+  criadoPorId  String?   @map("criado_por_id") @db.Uuid
+  iniciadoEm   DateTime? @map("iniciado_em")
+  finalizadoEm DateTime? @map("finalizado_em")
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  tenant    Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  criadoPor User?  @relation(fields: [criadoPorId], references: [id], onDelete: SetNull)
+
+  @@index([tenantId, status])
+  @@map("import_jobs")
+}
