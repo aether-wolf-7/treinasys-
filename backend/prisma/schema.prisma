@@ -345,6 +345,11 @@ model User {
   ultimoLoginEm      DateTime? @map("ultimo_login_em")
   precisaTrocarSenha Boolean   @default(true) @map("precisa_trocar_senha")
 
+  /// Momento da última troca de senha. Access token emitido ANTES disso é
+  /// recusado no middleware de autenticação: é assim que "redefinir senha"
+  /// derruba de verdade as sessões abertas, sem precisar de Redis.
+  senhaAlteradaEm DateTime? @map("senha_alterada_em")
+
   /// Módulo 3: "permitir reinício de treinamento" no cadastro do usuário.
   /// Autorização geral; a autorização pontual fica em Enrollment.reinicioAutorizado.
   permitirReinicio Boolean @default(false) @map("permitir_reinicio")
