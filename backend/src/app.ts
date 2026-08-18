@@ -1,13 +1,13 @@
 import compression from 'compression'
 import cors from 'cors'
 import express, { type Express } from 'express'
-import rateLimit from 'express-rate-limit'
 import helmet from 'helmet'
 import pinoHttp from 'pino-http'
 import { env } from './config/env'
 import { logger } from './lib/logger'
 import { prisma } from './lib/prisma'
 import { errorHandler, notFoundHandler } from './middlewares/error-handler'
+import { limiteGlobal } from './middlewares/rate-limit'
 import { authRoutes } from './modules/auth/auth.routes'
 import { sendError, sendOk } from './utils/response'
 
@@ -37,14 +37,7 @@ export function criarApp(): Express {
     }),
   )
 
-  app.use(
-    rateLimit({
-      windowMs: 60 * 1000,
-      limit: 120,
-      standardHeaders: 'draft-7',
-      legacyHeaders: false,
-    }),
-  )
+  app.use(limiteGlobal)
 
   app.get('/health', async (_req, res) => {
     try {
