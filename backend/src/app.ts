@@ -9,6 +9,7 @@ import { prisma } from './lib/prisma'
 import { errorHandler, notFoundHandler } from './middlewares/error-handler'
 import { limiteGlobal } from './middlewares/rate-limit'
 import { authRoutes } from './modules/auth/auth.routes'
+import { dashboardRoutes } from './modules/dashboard/dashboard.routes'
 import { sendError, sendOk } from './utils/response'
 
 export function criarApp(): Express {
@@ -49,6 +50,7 @@ export function criarApp(): Express {
   })
 
   app.use('/api/v1/auth', authRoutes)
+  app.use('/api/v1/dashboard', dashboardRoutes)
 
   app.use(notFoundHandler)
   app.use(errorHandler)
