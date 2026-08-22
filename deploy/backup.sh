@@ -23,6 +23,9 @@ carimbo="$(date +%Y-%m-%d_%H%M)"
 destino="${DIR_BACKUP}/treinasys_${carimbo}.sql.gz.gpg"
 
 mkdir -p "$DIR_BACKUP"
+# Sai de qualquer diretorio sem permissao de leitura (ex.: /root quando
+# chamado via sudo), senao o `find` da retencao reclama no final.
+cd "$DIR_BACKUP"
 
 if [[ ! -f "$ARQ_CHAVE" ]]; then
   echo "ERRO: chave de criptografia nao encontrada em ${ARQ_CHAVE}"
